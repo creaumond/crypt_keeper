@@ -40,10 +40,6 @@ OptionParser.new do |opts|
   opts.on("--old-encryptor [old encryptor]", "The old encryptor") do |v|
     options[:old_encryptor] = v
   end
-
-  opts.on("--query-log [file]", "ActiveRecord query log") do |v|
-    options[:query_log] = v
-  end
 end.parse!
 
 def get_required_arg(arg, options)
@@ -58,10 +54,6 @@ columns         = get_required_arg(:columns, options).split(',')
 encryptor       = get_required_arg(:old_encryptor, options)
 env             = ENV.fetch('RAILS_ENV', 'development')
 
-if options[:query_log].present?
-  ActiveRecord::Base.logger = Logger.new(options[:query_log])
-end
-
 if encryptor == "aes"
   old_encryptor = CryptKeeper::Provider::Aes.new(key: old_key)
   new_encryptor = CryptKeeper::Provider::AesNew.new(key: new_key, salt: salt)
@@ -73,23 +65,26 @@ else
   exit 1
 end
 
+
+
 class MigrateData < ActiveRecord::Base
-  self.inheritance_column = :_disable_sti_
-
   def self.reencrypt_all(encrypted_fields, old_encryptor, new_encryptor)
-    ActiveRecord::Base.transaction do
-      find_each do |record|
-        new_hash = encrypted_fields.each_with_object({}) do |field, hash|
-          next unless raw = record[field].presence
+    Applicant.find_in_batches(batch_size: 1000) do |records|
+      ActiveRecord::Base.transaction do
+        records.each do |record|
+          encrypted_fields.each do |f|
+            begin
+              plaintext  = old_encryptor.decrypt(record[f])
+              ciphertext = new_encryptor.encrypt(plaintext)
 
-          plaintext   = old_encryptor.decrypt(raw)
-          ciphertext  = new_encryptor.encrypt(plaintext)
-          hash[field] = ciphertext
+              record.update_attributes! f => ciphertext
+              yield record if block_given?
+            rescue => e
+              puts "rescued: #{e}"
+              next
+            end
+          end
         end
-
-        updated = record.update_attributes!(new_hash) unless new_hash.empty?
-
-        yield record, updated if block_given?
       end
     end
   end
@@ -98,10 +93,7 @@ end
 ActiveRecord::Base.establish_connection(config.fetch(env))
 MigrateData.table_name = table_name
 
-MigrateData.reencrypt_all(columns, old_encryptor, new_encryptor) do |r, updated|
-  if updated
-    puts "#{r.id} is now re-encrypted"
-  else
-    puts "#{r.id} was not updated"
-  end
+MigrateData.reencrypt_all(columns, old_encryptor, new_encryptor) do |r|
+  puts "#{r.id} is now re-encrypted"
 end
+
