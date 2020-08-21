@@ -77,22 +77,29 @@ class MigrateData < ActiveRecord::Base
   self.inheritance_column = :_disable_sti_
 
   def self.reencrypt_all(encrypted_fields, old_encryptor, new_encryptor)
-    Applicant.find_in_batches(batch_size: 10000) do |records, batch|
-      puts "Processing group ##{batch}"
-      records.each do |record|
-        new_hash = encrypted_fields.each_with_object({}) do |field, hash|
-          next unless raw = record[field].presence
+    total_count = self.count
+    max_threads = 30
+    per_thread = total_count / max_threads
+    threads = []
 
-          plaintext   = old_encryptor.decrypt(raw)
-          ciphertext  = new_encryptor.encrypt(plaintext)
-          hash[field] = ciphertext
+    max_threads.times do |thread|
+      threads << Thread.new {
+        records = self.limit(per_thread).offset(thread * per_thread)
+        records.each do |record|
+          new_hash = encrypted_fields.each_with_object({}) do |field, hash|
+            next unless raw = record[field].presence
+
+            plaintext   = old_encryptor.decrypt(raw)
+            ciphertext  = new_encryptor.encrypt(plaintext)
+            hash[field] = ciphertext
+          end
+
+          updated = record.update_attributes!(new_hash) unless new_hash.empty?
+          yield record, updated if block_given?
         end
-
-        updated = record.update_attributes!(new_hash) unless new_hash.empty?
-
-        yield record, updated if block_given?
-      end
+      }
     end
+    threads.each(&:join)
   end
 end
 
